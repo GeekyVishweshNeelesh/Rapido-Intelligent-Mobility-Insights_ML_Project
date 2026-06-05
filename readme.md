@@ -9,8 +9,7 @@
 [![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://rapido-project.streamlit.app/)
 
 > **Deployed on Streamlit Cloud** — Fully interactive dashboard with 4 live ML models.
-> Click the badge above or visit:
-> `https://rapido-project.streamlit.app/`
+
 
 ---
 

@@ -107,27 +107,44 @@ def get_defaults(model_num):
     return MODEL1_DEFAULTS if model_num == 1 else OTHER_DEFAULTS
 
 def encode_time_minutes(minutes, encoder):
-    target = f'1970-01-01 00:00:00.000000{int(minutes):03d}'
-    classes = list(encoder.classes_)
-    if target in classes:
-        return classes.index(target)
+    """Safely encode minutes into datetime-encoded label index."""
     try:
-        min_ns = int(encoder.classes_[0].split('.')[-1])
-        max_ns = int(encoder.classes_[-1].split('.')[-1])
-        clamped = max(min_ns, min(max_ns, int(minutes)))
-        tc = f'1970-01-01 00:00:00.000000{clamped:03d}'
-        if tc in classes:
-            return classes.index(tc)
+        if not hasattr(encoder, 'classes_') or len(encoder.classes_) == 0:
+            return 0
+        target = f'1970-01-01 00:00:00.000000{int(minutes):03d}'
+        classes = list(encoder.classes_)
+        if target in classes:
+            return classes.index(target)
+        try:
+            min_ns = int(encoder.classes_[0].split('.')[-1])
+            max_ns = int(encoder.classes_[-1].split('.')[-1])
+            clamped = max(min_ns, min(max_ns, int(minutes)))
+            tc = f'1970-01-01 00:00:00.000000{clamped:03d}'
+            if tc in classes:
+                return classes.index(tc)
+        except Exception:
+            pass
+        return len(classes) // 2
     except Exception:
-        pass
-    return len(classes) // 2
+        return 0
+
+def is_lfs_pointer(path):
+    """Check if a file is a Git LFS pointer instead of the real file."""
+    try:
+        with open(path, 'rb') as f:
+            header = f.read(50)
+        return b'version https://git-lfs' in header
+    except Exception:
+        return False
 
 @st.cache_data
 def load_master_data():
     try:
-        if os.path.exists(CSV_PATH):
-            return pd.read_csv(CSV_PATH, nrows=50000)
-        return None
+        if not os.path.exists(CSV_PATH):
+            return None
+        if is_lfs_pointer(CSV_PATH):
+            return None
+        return pd.read_csv(CSV_PATH, nrows=50000)
     except Exception:
         return None
 
@@ -144,7 +161,12 @@ def load_all_models():
         models[num] = {}
         for comp, fname in comps.items():
             try:
-                with open(os.path.join(MODEL_PATH, fname), 'rb') as f:
+                fpath = os.path.join(MODEL_PATH, fname)
+                # Skip LFS pointer files
+                if is_lfs_pointer(fpath):
+                    models[num][comp] = None
+                    continue
+                with open(fpath, 'rb') as f:
                     models[num][comp] = pickle.load(f)
             except Exception:
                 models[num][comp] = None
@@ -152,12 +174,17 @@ def load_all_models():
 
 @st.cache_data
 def load_comparison_csv(model_num):
+    """Load model comparison CSV — validates it's a real CSV not an LFS pointer."""
     try:
         path = os.path.join(MODEL_PATH, f'model{model_num}_comparison.csv')
-        if os.path.exists(path):
-            df = pd.read_csv(path)
-            if df is not None and not df.empty:
-                return df
+        if not os.path.exists(path):
+            return None
+        if is_lfs_pointer(path):
+            return None
+        df = pd.read_csv(path)
+        # Validate it's a real comparison CSV (must have Algorithm column)
+        if df is not None and not df.empty and 'Algorithm' in df.columns:
+            return df
         return None
     except Exception:
         return None
@@ -186,14 +213,16 @@ def prepare_input(user_inputs, model_num, models):
                     try:
                         input_df[col] = encode_time_minutes(float(val), encoder)
                     except Exception:
-                        input_df[col] = encode_time_minutes(55, encoder)
+                        input_df[col] = 0
                     continue
                 if isinstance(val, str):
                     try:
-                        if val in encoder.classes_:
+                        if hasattr(encoder, 'classes_') and val in encoder.classes_:
                             input_df[col] = encoder.transform([val])[0]
-                        else:
+                        elif hasattr(encoder, 'classes_') and len(encoder.classes_) > 0:
                             input_df[col] = encoder.transform([encoder.classes_[0]])[0]
+                        else:
+                            input_df[col] = 0
                     except Exception:
                         input_df[col] = 0
         input_df = input_df.apply(pd.to_numeric, errors='coerce').fillna(0)
@@ -241,21 +270,27 @@ def render_sidebar():
         ], label_visibility="collapsed")
         st.markdown("---")
 
-        # CSV status
+        # CSV status — detect LFS pointer
         st.markdown("### 📁 Data Status")
-        if os.path.exists(CSV_PATH):
+        if not os.path.exists(CSV_PATH):
+            st.error("❌ CSV Not Found")
+        elif is_lfs_pointer(CSV_PATH):
+            st.warning("⚠️ CSV is LFS pointer\n(add packages.txt)")
+        else:
             size_mb = os.path.getsize(CSV_PATH)/1024/1024
             st.success(f"✅ CSV Ready ({size_mb:.1f} MB)")
-        else:
-            st.warning("⚠️ CSV not found (Git LFS may not have pulled)")
 
+        # Model status — detect LFS pointer
         st.markdown("### 🤖 Model Status")
         models = load_all_models()
         for num, name in {1:"Ride Outcome",2:"Fare Prediction",3:"Cancel Risk",4:"Driver Delay"}.items():
             if models[num]['model'] is not None:
                 st.success(f"✅ Model {num}: {name}")
+            elif os.path.exists(os.path.join(MODEL_PATH, f'model{num}_ride_outcome_best.pkl' if num==1 else f'model{num}_fare_prediction_best.pkl' if num==2 else f'model{num}_customer_cancellation_best.pkl' if num==3 else f'model{num}_driver_delay_best.pkl')) and is_lfs_pointer(os.path.join(MODEL_PATH, f'model{num}_ride_outcome_best.pkl' if num==1 else f'model{num}_fare_prediction_best.pkl' if num==2 else f'model{num}_customer_cancellation_best.pkl' if num==3 else f'model{num}_driver_delay_best.pkl')):
+                st.warning(f"⚠️ Model {num}: LFS pointer")
             else:
                 st.error(f"❌ Model {num}: {name}")
+
         st.markdown("---")
         st.markdown("""<div style='text-align:center;color:#555;font-size:11px;'>
             Rapido ML v1.0<br>
@@ -358,7 +393,7 @@ def page_home():
                 <span style='color:#888;font-size:12px;'> — {desc}</span>
             </div>""", unsafe_allow_html=True)
 
-# ── PAGE 2: EDA (live from CSV via Git LFS) ──
+# ── PAGE 2: EDA ──
 def page_eda():
     st.markdown("<h1>📊 EDA Dashboard</h1>", unsafe_allow_html=True)
     st.markdown("---")
@@ -366,8 +401,11 @@ def page_eda():
         df = load_master_data()
 
     if df is None:
-        st.error("❌ CSV not found. Make sure `master_dataset_engineered.csv` was pulled via Git LFS.")
-        st.code("git lfs pull", language="bash")
+        if os.path.exists(CSV_PATH) and is_lfs_pointer(CSV_PATH):
+            st.error("❌ CSV is a Git LFS pointer — not the real file.")
+            st.info("Fix: Add `packages.txt` with content `git-lfs` to your repo root and redeploy.")
+        else:
+            st.error("❌ CSV not found. Make sure `master_dataset_engineered.csv` is in the repo.")
         return
 
     st.success(f"✅ Loaded {len(df):,} records | {len(df.columns)} columns")
@@ -506,7 +544,7 @@ def page_ride_outcome():
     st.markdown("---")
     models = load_all_models()
     if models[1]['model'] is None:
-        st.error("❌ Model 1 not loaded.")
+        st.error("❌ Model 1 not loaded. Check models/ folder or Git LFS setup.")
         return
     st.markdown("<div class='section-header'>📝 Enter Booking Details</div>", unsafe_allow_html=True)
     inputs = get_common_inputs(suffix="_m1", model_num=1)
@@ -533,7 +571,7 @@ def page_ride_outcome():
             with st.spinner("Predicting..."):
                 pred  = models[1]['model'].predict(scaled)
                 proba = models[1]['model'].predict_proba(scaled)
-            # Confirmed from Colab: 0=Cancelled, 1=Completed
+            # Confirmed: 0=Cancelled, 1=Completed
             class_names     = {0:"❌ Cancelled", 1:"✅ Completed"}
             predicted_class = int(pred[0])
             outcome = class_names.get(predicted_class, f"Class {predicted_class}")
@@ -691,6 +729,8 @@ def page_model_performance():
     st.markdown("<h1>📈 Model Performance</h1>", unsafe_allow_html=True)
     st.markdown("---")
     T = dict(paper_bgcolor='#1e1e1e', plot_bgcolor='#1e1e1e', font_color='white')
+
+    # Fallback data — used when comparison CSVs are missing or LFS pointers
     fallback = {
         1: pd.DataFrame({'Algorithm':['Logistic Regression','Random Forest','XGBoost','LightGBM'],
                          'Accuracy' :[0.72,0.85,0.87,0.86],'F1-Score':[0.71,0.84,0.86,0.85]}),
@@ -710,19 +750,27 @@ def page_model_performance():
     tab1,tab2,tab3,tab4 = st.tabs(["🎯 Model 1","💰 Model 2","🚫 Model 3","⏱️ Model 4"])
     for tab,num in zip([tab1,tab2,tab3,tab4],[1,2,3,4]):
         with tab:
+            # Safe loading — falls back to hardcoded data if CSV is missing/LFS pointer
             loaded  = load_comparison_csv(num)
             df_comp = loaded if loaded is not None else fallback[num]
+
             c1,c2 = st.columns(2)
-            with c1: st.dataframe(df_comp, use_container_width=True)
+            with c1:
+                st.dataframe(df_comp, use_container_width=True)
             with c2:
-                y_col  = 'RMSE (%)' if num==2 else 'Accuracy'
-                y_col  = y_col if y_col in df_comp.columns else df_comp.columns[1]
-                target = 10 if num==2 else 0.85
+                y_col  = 'RMSE (%)' if num == 2 else 'Accuracy'
+                # Safe column selection — never crashes on bad dataframe
+                if y_col not in df_comp.columns:
+                    numeric_cols = df_comp.select_dtypes(include=[np.number]).columns.tolist()
+                    y_col = numeric_cols[0] if numeric_cols else df_comp.columns[-1]
+                target = 10 if num == 2 else 0.85
                 fig = px.bar(df_comp, x='Algorithm', y=y_col, color=y_col,
                              color_continuous_scale='Oranges', title=f'{y_col} Comparison')
                 fig.add_hline(y=target, line_dash='dash', line_color='red',
                               annotation_text=f'Target: {target}')
-                fig.update_layout(**T); st.plotly_chart(fig, use_container_width=True)
+                fig.update_layout(**T)
+                st.plotly_chart(fig, use_container_width=True)
+
             best,metric,status,box = summaries[num]
             st.markdown(f"""<div class='prediction-box {box}' style='font-size:16px;'>
                 🏆 Best: {best} &nbsp;|&nbsp; {metric} &nbsp;|&nbsp; {status}
